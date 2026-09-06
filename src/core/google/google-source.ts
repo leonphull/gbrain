@@ -611,8 +611,9 @@ async function applyLoopDetection(
 const MAX_THREAD_FAILURES = 3;
 
 /**
- * Returns true when every gmail thread this run either imported or was
- * deliberately skipped (404-vanished, poison ledger). False = real failures
+ * Returns true when the delta lane landed every flagged thread (or skipped it
+ * deliberately: 404-vanished, poison ledger) AND, while a backfill is still
+ * open, that backfill made forward progress this run. False = real failures
  * remain, and the caller must NOT stamp `last_sync_at` — a poison thread
  * silently wedging the pipeline while the staleness gate reads fresh is the
  * exact trust failure the gate exists to prevent.
@@ -642,18 +643,101 @@ async function sweepGmail(
     return true;
   };
 
+  // Anchor the delta lane BEFORE importing anything: changes that land
+  // during the backfill are replayed by history.list.
+  if (!state.gmail_backfill_done && !state.gmail_history_id) {
+    const profile = await gmail.getProfile({ ...(deps.opts.signal ? { signal: deps.opts.signal } : {}) });
+    if (profile.emailAddress.toLowerCase() !== deps.cfg.account) {
+      deps.log(`[google] warning: token account ${profile.emailAddress} != source account ${deps.cfg.account}`);
+    }
+    state.gmail_history_id = profile.historyId;
+    writeGoogleState(deps.cfg.dir, state);
+  }
+
+  // ── Delta lane ──
+  // Runs FIRST on every sweep, even while the backfill is still open. A
+  // multi-year backfill is days of partial runs (rate limits, poison
+  // threads) and new mail must not queue behind it. The lanes are disjoint
+  // by construction: the delta replays changes since the history anchor,
+  // the backfill walks `before:floor`, and the floor predates the anchor.
+  const runDeltaLane = async (): Promise<boolean> => {
+    if (!state.gmail_history_id) return true;
+    let threadIds: string[];
+    let newHistoryId: string | null = null;
+    try {
+      ({ threadIds, newHistoryId } = await gmail.listHistoryThreadIds(state.gmail_history_id, {
+        ...(deps.opts.signal ? { signal: deps.opts.signal } : {}),
+      }));
+    } catch (e) {
+      if (!(e instanceof GoogleCursorExpiredError)) throw e;
+      // History expired (~1 week idle): windowed fallback from the newest
+      // imported message. BOUNDED like the backfill (the same >cap population
+      // exists here) — and the fresh historyId is only re-anchored when the
+      // listing was COMPLETE; a capped partial listing keeps the fallback lane
+      // active (gmail_newest_ms advances per processed thread, converging).
+      deps.log('[google] historyId expired; falling back to bookmark window');
+      // Anchor BEFORE listing (mirrors the backfill's zero-gap ordering): a
+      // message arriving between these two calls is either in the listing
+      // (post-anchor arrival) or replayed by history.list from the anchor.
+      // Anchoring after the listing would silently drop that message forever.
+      const profile = await gmail.getProfile({ ...(deps.opts.signal ? { signal: deps.opts.signal } : {}) });
+      const anchorCandidate = profile.historyId;
+      const sinceSec = Math.floor(((state.gmail_newest_ms ?? cutoffMs) - 86_400_000) / 1000);
+      const FALLBACK_MAX_PAGES = 20;
+      const ids = await gmail.listMessageIds(`after:${sinceSec}`, {
+        maxPages: FALLBACK_MAX_PAGES,
+        partialOk: true,
+        ...(deps.opts.signal ? { signal: deps.opts.signal } : {}),
+      });
+      threadIds = [...new Set(ids.map((m) => m.threadId))];
+      const likelyCapped = ids.length >= FALLBACK_MAX_PAGES * 100;
+      if (!likelyCapped) newHistoryId = anchorCandidate;
+    }
+    let failed = 0;
+    for (const tid of threadIds) {
+      if (deps.opts.signal?.aborted) return false;
+      if (poisoned(tid)) continue;
+      try {
+        const thread = await processThread(deps, gmail, tid, activePack, summary, countedSlugs);
+        if (failCounts[tid]) delete failCounts[tid];
+        const newest = thread?.messages[thread.messages.length - 1]?.internalDateMs ?? 0;
+        if (newest > (state.gmail_newest_ms ?? 0)) state.gmail_newest_ms = newest;
+        progressTick(`thread ${tid}`);
+      } catch (e) {
+        if (e instanceof GoogleCursorExpiredError && e.status === 404) {
+          // Thread deleted after the history record was written — gone is
+          // gone. Treating this as a failure would freeze the delta cursor
+          // and re-404 the same thread every sync until the historyId itself
+          // expired (~1 week of wedged deltas).
+          deps.log(`[google] thread ${tid} vanished (404); skipping`);
+          progressTick(`thread ${tid} gone`);
+          continue;
+        }
+        failCounts[tid] = (failCounts[tid] ?? 0) + 1;
+        failed++;
+        summary.failedFiles++;
+        summary.status = 'partial';
+        deps.log(`[google] thread ${tid} failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+    // The delta cursor advances only when every flagged thread landed —
+    // a partial drain re-lists the same window next run (idempotent).
+    if (failed === 0 && newHistoryId) {
+      state.gmail_history_id = newHistoryId;
+    }
+    return failed === 0;
+  };
+  const deltaOk = await runDeltaLane();
+  if (deps.opts.signal?.aborted) return false;
+
   // ── Initial (or resumed) backfill ──
   if (!state.gmail_backfill_done) {
-    // Anchor the delta lane BEFORE importing anything: changes that land
-    // during the backfill are replayed by history.list afterwards.
-    if (!state.gmail_history_id) {
-      const profile = await gmail.getProfile({ ...(deps.opts.signal ? { signal: deps.opts.signal } : {}) });
-      if (profile.emailAddress.toLowerCase() !== deps.cfg.account) {
-        deps.log(`[google] warning: token account ${profile.emailAddress} != source account ${deps.cfg.account}`);
-      }
-      state.gmail_history_id = profile.historyId;
-      writeGoogleState(deps.cfg.dir, state);
-    }
+    // Freshness while the backfill is open: the run counts as fresh only
+    // when the delta lane landed AND the floor moved (or closed) this run.
+    // A wedged backfill that makes no forward progress keeps reading stale
+    // to the staleness gate, exactly as before the delta lane moved ahead.
+    let backfillAdvanced = false;
+    let backfillFailures = 0;
     let floorMs = state.gmail_backfill_floor_ms ?? nowMs + 60_000;
     for (;;) {
       if (deps.opts.signal?.aborted) return false;
@@ -700,6 +784,7 @@ async function sweepGmail(
             }
             failCounts[tid] = (failCounts[tid] ?? 0) + 1;
             batchFailed = true;
+            backfillFailures++;
             summary.failedFiles++;
             summary.status = 'partial';
             deps.log(`[google] thread ${tid} failed: ${e instanceof Error ? e.message : String(e)}`);
@@ -713,6 +798,7 @@ async function sweepGmail(
         if (batchFailed) break;
         if (processedAny && batchOldest < floorMs) {
           state.gmail_backfill_floor_ms = batchOldest;
+          backfillAdvanced = true;
           writeGoogleState(deps.cfg.dir, state);
         }
       }
@@ -721,97 +807,34 @@ async function sweepGmail(
         // Leave the floor at the last good batch; the next run re-lists from
         // there and retries the failed thread first. Persist the fail ledger
         // so repeated failures accumulate toward the poison threshold across
-        // runs, then report the failure — this run did NOT refresh the data.
+        // runs, then report: fresh only if the delta landed and the floor
+        // moved before the failure.
         writeGoogleState(deps.cfg.dir, state);
-        return false;
+        return deltaOk && backfillAdvanced;
       }
       if (!processedAny || batchOldest >= floorMs) {
         // Nothing moved the floor (all skipped/vanished or all
         // same-timestamp): step below the oldest listed page to guarantee
         // termination. Only reachable with zero failures.
         state.gmail_backfill_floor_ms = Math.max(cutoffMs - 1, floorMs - 86_400_000);
+        backfillAdvanced = true;
         writeGoogleState(deps.cfg.dir, state);
       }
       floorMs = state.gmail_backfill_floor_ms ?? cutoffMs;
       if (floorMs <= cutoffMs) break;
     }
-    if (summary.failedFiles === 0) {
+    if (backfillFailures === 0) {
       state.gmail_backfill_done = true;
       state.gmail_backfill_floor_ms = null;
       writeGoogleState(deps.cfg.dir, state);
     } else {
       // Failures stay in the window; the next run retries from the floor.
       writeGoogleState(deps.cfg.dir, state);
-      return false;
+      return deltaOk && backfillAdvanced;
     }
   }
 
-  // ── Delta lane ──
-  if (!state.gmail_history_id) return true;
-  let threadIds: string[];
-  let newHistoryId: string | null = null;
-  try {
-    ({ threadIds, newHistoryId } = await gmail.listHistoryThreadIds(state.gmail_history_id, {
-      ...(deps.opts.signal ? { signal: deps.opts.signal } : {}),
-    }));
-  } catch (e) {
-    if (!(e instanceof GoogleCursorExpiredError)) throw e;
-    // History expired (~1 week idle): windowed fallback from the newest
-    // imported message. BOUNDED like the backfill (the same >cap population
-    // exists here) — and the fresh historyId is only re-anchored when the
-    // listing was COMPLETE; a capped partial listing keeps the fallback lane
-    // active (gmail_newest_ms advances per processed thread, converging).
-    deps.log('[google] historyId expired; falling back to bookmark window');
-    // Anchor BEFORE listing (mirrors the backfill's zero-gap ordering): a
-    // message arriving between these two calls is either in the listing
-    // (post-anchor arrival) or replayed by history.list from the anchor.
-    // Anchoring after the listing would silently drop that message forever.
-    const profile = await gmail.getProfile({ ...(deps.opts.signal ? { signal: deps.opts.signal } : {}) });
-    const anchorCandidate = profile.historyId;
-    const sinceSec = Math.floor(((state.gmail_newest_ms ?? cutoffMs) - 86_400_000) / 1000);
-    const FALLBACK_MAX_PAGES = 20;
-    const ids = await gmail.listMessageIds(`after:${sinceSec}`, {
-      maxPages: FALLBACK_MAX_PAGES,
-      partialOk: true,
-      ...(deps.opts.signal ? { signal: deps.opts.signal } : {}),
-    });
-    threadIds = [...new Set(ids.map((m) => m.threadId))];
-    const likelyCapped = ids.length >= FALLBACK_MAX_PAGES * 100;
-    if (!likelyCapped) newHistoryId = anchorCandidate;
-  }
-  let failed = 0;
-  for (const tid of threadIds) {
-    if (deps.opts.signal?.aborted) return false;
-    if (poisoned(tid)) continue;
-    try {
-      const thread = await processThread(deps, gmail, tid, activePack, summary, countedSlugs);
-      if (failCounts[tid]) delete failCounts[tid];
-      const newest = thread?.messages[thread.messages.length - 1]?.internalDateMs ?? 0;
-      if (newest > (state.gmail_newest_ms ?? 0)) state.gmail_newest_ms = newest;
-      progressTick(`thread ${tid}`);
-    } catch (e) {
-      if (e instanceof GoogleCursorExpiredError && e.status === 404) {
-        // Thread deleted after the history record was written — gone is
-        // gone. Treating this as a failure would freeze the delta cursor
-        // and re-404 the same thread every sync until the historyId itself
-        // expired (~1 week of wedged deltas).
-        deps.log(`[google] thread ${tid} vanished (404); skipping`);
-        progressTick(`thread ${tid} gone`);
-        continue;
-      }
-      failCounts[tid] = (failCounts[tid] ?? 0) + 1;
-      failed++;
-      summary.failedFiles++;
-      summary.status = 'partial';
-      deps.log(`[google] thread ${tid} failed: ${e instanceof Error ? e.message : String(e)}`);
-    }
-  }
-  // The delta cursor advances only when every flagged thread landed —
-  // a partial drain re-lists the same window next run (idempotent).
-  if (failed === 0 && newHistoryId) {
-    state.gmail_history_id = newHistoryId;
-  }
-  return failed === 0;
+  return deltaOk;
 }
 
 // ── Full reconcile (deletes) ─────────────────────────────────────────────────
