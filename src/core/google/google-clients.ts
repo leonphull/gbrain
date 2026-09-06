@@ -45,6 +45,9 @@ interface GoogleErrorBody {
 
 type ApiHint = 'gmail' | 'calendar-json' | 'people';
 
+/** Retries granted to a 403/429 rate limit before it maps to 'rate_limited'. */
+export const RATE_LIMIT_RETRIES = 6;
+
 /** Shared request core with auth, refresh-retry, and rate-limit handling. */
 export class GoogleApiClient {
   constructor(
@@ -58,10 +61,18 @@ export class GoogleApiClient {
   async fetchJSON<T>(
     url: string,
     apiHint: ApiHint,
-    opts: { signal?: AbortSignal; retries?: number } = {},
+    opts: { signal?: AbortSignal; retries?: number; rateLimitRetries?: number } = {},
   ): Promise<T> {
     const retries = opts.retries ?? 2;
-    for (let attempt = 0; attempt <= retries; attempt++) {
+    // Rate limits get their own, deeper budget: Gmail's per-user quota is a
+    // sliding per-second window, and a hot sweep trips it on ~10% of thread
+    // fetches. Two 2s/4s retries left those threads failing at random, and
+    // one random failure per run is enough to hold back both the delta
+    // cursor and the backfill floor forever. Backoff doubles from 2s and
+    // caps at 60s (≈2 min worst case per request); Retry-After still wins.
+    const rateLimitRetries = opts.rateLimitRetries ?? RATE_LIMIT_RETRIES;
+    const maxAttempt = Math.max(retries, rateLimitRetries);
+    for (let attempt = 0; attempt <= maxAttempt; attempt++) {
       const token = await this.tokens.getAccessToken();
       const res = await this.fetchImpl(url, {
         headers: { authorization: `Bearer ${token}` },
@@ -89,7 +100,7 @@ export class GoogleApiClient {
       }
       if (res.status === 403 || res.status === 429) {
         const waitMs = parseRetryAfterMs(res.headers.get('retry-after')) ?? Math.min(60_000, 2 ** attempt * 2_000);
-        if (attempt < retries) {
+        if (attempt < rateLimitRetries) {
           this.log(`[google] HTTP ${res.status}; retrying in ${Math.round(waitMs / 1000)}s`);
           await new Promise<void>((resolve) => {
             const t = setTimeout(resolve, waitMs);
