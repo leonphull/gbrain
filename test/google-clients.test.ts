@@ -29,6 +29,7 @@ import {
   GoogleCursorExpiredError,
   PeopleClient,
   type FetchImpl,
+  RATE_LIMIT_RETRIES,
 } from '../src/core/google/google-clients.ts';
 
 // ── extractCalendarMethod (pure) ─────────────────────────────────────────────
@@ -363,9 +364,29 @@ describe('GoogleApiClient retry exhaustion + 403 mapping', () => {
     }
     expect(thrown).toBeInstanceOf(CredentialError);
     expect((thrown as CredentialError).code).toBe('rate_limited');
-    // Default retries=2: attempts 0 and 1 are retried, attempt 2 throws.
-    expect(apiCalls).toBe(3);
+    // Rate limits get the deeper budget: RATE_LIMIT_RETRIES retries, then throw.
+    expect(apiCalls).toBe(RATE_LIMIT_RETRIES + 1);
     expect(h.tokenPosts()).toBe(0); // a rate limit never triggers a token refresh
+  });
+
+  test('403 userRateLimitExceeded is retried across the rate-limit budget, not the generic one', async () => {
+    let apiCalls = 0;
+    const h = makeHarness(() => {
+      apiCalls++;
+      if (apiCalls <= 5) {
+        return json(
+          { error: { code: 403, message: 'User-rate limit exceeded.', errors: [{ reason: 'userRateLimitExceeded' }] } },
+          403,
+          { 'retry-after': '0' },
+        );
+      }
+      return json({ emailAddress: 'a@example.com', historyId: '99' });
+    });
+    const gmail = new GmailClient(h.tokens, h.fetchImpl, () => {}, CLIENT_ID);
+    const profile = await gmail.getProfile();
+    expect(profile.historyId).toBe('99');
+    expect(apiCalls).toBe(6); // five rate-limit hits survived, sixth call landed
+    expect(h.tokenPosts()).toBe(0);
   });
 
   test("403 with a non-rate, non-quota reason maps to 'upstream' WITHOUT a retry", async () => {

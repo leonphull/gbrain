@@ -727,7 +727,19 @@ async function sweepGmail(
     }
     return failed === 0;
   };
-  const deltaOk = await runDeltaLane();
+  let deltaOk: boolean;
+  try {
+    deltaOk = await runDeltaLane();
+  } catch (e) {
+    if (deps.opts.signal?.aborted) return false;
+    // A throw here (history.list itself rate-limited or 5xx) is a delta-lane
+    // failure, not a reason to skip the backfill: the floor still moves this
+    // run and the same anchor is re-listed next run. Credential-class errors
+    // resurface on the backfill's first call and reach the caller from there.
+    summary.status = 'partial';
+    deps.log(`[google] delta lane failed: ${e instanceof Error ? e.message : String(e)}`);
+    deltaOk = false;
+  }
   if (deps.opts.signal?.aborted) return false;
 
   // ── Initial (or resumed) backfill ──

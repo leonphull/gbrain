@@ -90,6 +90,8 @@ interface FakeGoogle {
   history: string[][];
   historyResponseId: string;
   historyExpired: boolean;
+  /** history.list answers 500 (a transient upstream failure). */
+  historyFail: boolean;
   failThreads: Set<string>;
   contacts: unknown[];
   contactsDelta: unknown[];
@@ -110,6 +112,7 @@ function emptyFx(): FakeGoogle {
     history: [],
     historyResponseId: '1000',
     historyExpired: false,
+    historyFail: false,
     failThreads: new Set(),
     contacts: [],
     contactsDelta: [],
@@ -161,6 +164,7 @@ function buildFetch(fx: FakeGoogle): FetchImpl {
     }
 
     if (u.pathname.endsWith('/users/me/history')) {
+      if (fx.historyFail) return json({ error: { code: 500, message: 'backend error' } }, 500);
       if (fx.historyExpired) return json({ error: { code: 404, message: 'Start history id is too old' } }, 404);
       return json({
         historyId: fx.historyResponseId,
@@ -634,6 +638,60 @@ describe('google-source materialize', () => {
         expect(res3.failedFiles).toBeUndefined();
         expect(readGoogleState(dir).gmail_backfill_done).toBe(true);
         expect(await lastSyncAt()).not.toBeNull();
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('a delta-lane throw does not starve an open backfill: the backfill still completes, nothing stamps', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gsrc-delta-throw-'));
+    const fx = emptyFx();
+    const vault = makeVault();
+    // Six single-message threads, days 40..45 ago.
+    const tids = ['17aa00000000e001', '17aa00000000e002', '17aa00000000e003', '17aa00000000e004', '17aa00000000e005', '17aa00000000e006'];
+    for (let i = 0; i < 6; i++) {
+      fx.messages.push(
+        gmsg(`18c2f4a9b3d21e1${i + 1}`, tids[i], daysAgoMs(40 + i), {
+          headers: { From: `P${i} <p${i}@example.com>`, To: 'a@example.com', Subject: `Old thread ${i}` },
+          body: `old body ${i}`,
+        }),
+      );
+    }
+    try {
+      await insertGoogleSource(dir);
+      await withHome(async () => {
+        // Run 1: the oldest thread fails → backfill stays open.
+        fx.failThreads.add(tids[5]);
+        const res1 = await sweep(dir, fx, vault, {}, 'gmail');
+        expect(res1.status).toBe('partial');
+        expect(readGoogleState(dir).gmail_backfill_done).toBe(false);
+        const pages1 = (await slugsWhere(`slug LIKE 'emails/%'`)).length;
+        expect(pages1).toBe(5); // the five newer threads landed before the failure
+
+        // Run 2: history.list itself 500s while the failing thread recovers.
+        fx.historyFail = true;
+        fx.failThreads.clear();
+        const res2 = await sweep(dir, fx, vault, {}, 'gmail');
+        expect(res2.status).toBe('partial'); // the delta lane failed honestly
+        const state2 = readGoogleState(dir);
+        expect(state2.gmail_history_id).toBe('1000'); // cursor untouched
+        expect(state2.gmail_backfill_done).toBe(true); // backfill still completed
+        expect(state2.gmail_backfill_floor_ms).toBeNull();
+        expect((await slugsWhere(`slug LIKE 'emails/%'`)).length).toBe(6); // the recovered thread landed
+        const row = await engine.executeRaw<{ last_sync_at: string | null }>(
+          `SELECT last_sync_at FROM sources WHERE id = 'gsrc'`,
+        );
+        expect(row[0].last_sync_at).toBeNull(); // delta failed → not fresh
+
+        // Run 3: upstream recovers; the run is clean and stamps.
+        fx.historyFail = false;
+        const res3 = await sweep(dir, fx, vault, {}, 'gmail');
+        expect(res3.failedFiles).toBeUndefined();
+        const row3 = await engine.executeRaw<{ last_sync_at: string | null }>(
+          `SELECT last_sync_at FROM sources WHERE id = 'gsrc'`,
+        );
+        expect(row3[0].last_sync_at).not.toBeNull();
       });
     } finally {
       rmSync(dir, { recursive: true, force: true });
