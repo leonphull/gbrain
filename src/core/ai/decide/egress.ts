@@ -20,6 +20,7 @@
  */
 import type { BrainEngine } from '../../engine.ts';
 import { privatePagesFilterFragment } from '../../search/private-visibility.ts';
+import { thirdPartyDecideProvider } from './config.ts';
 import type { DecideConfig } from './config.ts';
 import { SLOT_SPECS } from './slots.ts';
 import type { DecideQuestion, DecideSlot, EvidenceItem } from './types.ts';
@@ -63,7 +64,7 @@ export async function checkEgress(
   questions: readonly DecideQuestion[],
   opts: { consent?: 'decide' | 'reranker'; slot?: DecideSlot } = {},
 ): Promise<EgressVerdict> {
-  const thirdParty = provider.startsWith('typesafe:');
+  const thirdParty = thirdPartyDecideProvider(provider);
   const keyDefaultClasses: readonly string[] = opts.slot && cfg.slots[opts.slot]?.keyDefault ? SLOT_SPECS[opts.slot].egressClasses : [];
   const denied = new Set(cfg.denySources);
   const all = [...Object.values(state), ...questions.flatMap((q) => Object.values(q.inputs ?? {}))];

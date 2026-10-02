@@ -117,7 +117,7 @@ export async function runJudgeAgreement(args: string[]): Promise<number> {
   const input = flagValue(args, '--input');
   if ((suite !== 'longmemeval' && suite !== 'grounding') || !input) { console.error(`Usage: gbrain decide ${JUDGE_AGREEMENT_USAGE}`); return 1; }
   const provider = flagValue(args, '--provider') ?? DEFAULT_TYPESAFE_PROVIDER;
-  if (!isValidProvider(provider) || provider === 'none') { console.error(`--provider must be typesafe:<model> or llm:<provider:model> (got ${provider})`); return 1; }
+  if (!isValidProvider(provider) || provider === 'none') { console.error(`--provider must be typesafe:<model>, systemone:<model> or llm:<provider:model> (got ${provider})`); return 1; }
   const threshold = Number(flagValue(args, '--threshold') ?? '0.5');
   const limitRaw = flagValue(args, '--limit');
   const limit = limitRaw === undefined ? undefined : Number(limitRaw);

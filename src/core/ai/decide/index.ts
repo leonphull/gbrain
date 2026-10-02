@@ -16,7 +16,7 @@ import type { BrainEngine } from '../../engine.ts';
 import { loadConfigSnapshot } from '../../config-snapshot.ts';
 import { usageCostUsd } from '../../budget/reservation-cost.ts';
 import {
-  applyOpenAICompatConfig, applyResolveAuth, authToHeaders, chat, decideTransport, getCurrentBudgetTracker, requireConfig,
+  applyResolveAuth, authToHeaders, chat, decideTransport, getCurrentBudgetTracker, requireConfig,
 } from '../gateway.ts';
 import { invokeAI, isAIInvocationPolicyError, responseInvocationUsage } from '../invocation-guard.ts';
 import { recordOnTracker } from '../budget-record.ts';
@@ -98,8 +98,8 @@ export async function runDecide(req: DecideRequest, ctx: DecideContext): Promise
   if (now() >= deadlineAt) throw new DecideError('late', 'decide: no time left in the budget');
   const ordered = orderQuestions(allowed);
   const state = stateText(req.state);
-  const result = kind === 'typesafe'
-    ? await runTypesafe(req, ctx, cfg, { provider, lane, deadlineAt, ordered, state, now })
+  const result = kind === 'typesafe' || kind === 'systemone'
+    ? await runWire(req, ctx, cfg, { provider, lane, deadlineAt, ordered, state, now, kind })
     : await runLlm(req, cfg, { provider, lane, deadlineAt, ordered, state, now });
   result.refused = verdict.refused;
   result.latency_ms = now() - started;
@@ -113,6 +113,11 @@ interface RunArgs {
   ordered: DecideQuestion[];
   state: Record<string, string>;
   now: () => number;
+}
+
+interface WireRunArgs extends RunArgs {
+  /** Which Jev-wire recipe serves this id: TypeSafe cloud or a self-hosted server. */
+  kind: 'typesafe' | 'systemone';
 }
 
 function deadlineSignal(deadlineAt: number, now: () => number, caller?: AbortSignal): { signal: AbortSignal; done: () => void } {
@@ -130,18 +135,26 @@ function asDecideError(err: unknown, signal: AbortSignal, caller?: AbortSignal):
   return new DecideError('provider_error', `decide: transport failed (${err instanceof Error ? err.name : 'error'})`);
 }
 
-async function runTypesafe(req: DecideRequest, ctx: DecideContext, cfg: DecideConfig, a: RunArgs): Promise<DecideResult> {
-  const recipe = getRecipe('typesafe');
+async function runWire(req: DecideRequest, ctx: DecideContext, cfg: DecideConfig, a: WireRunArgs): Promise<DecideResult> {
+  const recipe = getRecipe(a.kind === 'systemone' ? 'systemone' : 'typesafe');
   const tp = recipe?.touchpoints.decide;
-  if (!recipe || !tp) throw new DecideError('provider_error', 'decide: TypeSafe recipe missing');
+  if (!recipe || !tp) throw new DecideError('provider_error', 'decide: System One recipe missing');
   const gw = requireConfig();
-  if (!typesafeApiKey(gw.env)) throw new DecideError('no_key', 'decide: TYPESAFE_API_KEY is not set');
-  const modelId = a.provider.replace(/^typesafe:/, '');
-  const url = `${applyOpenAICompatConfig(recipe, gw).baseURL.replace(/\/$/, '')}${tp.path}`;
+  if (a.kind === 'typesafe' && !typesafeApiKey(gw.env)) throw new DecideError('no_key', 'decide: TYPESAFE_API_KEY is not set');
+  const modelId = a.provider.replace(/^(typesafe|systemone):/, '');
+  // The self-hosted recipe has NO base_url_default on purpose: a configured
+  // `systemone:<model>` id must fail here, never fall back to TypeSafe cloud.
+  const baseURL = gw.base_urls?.[recipe.id] ?? recipe.base_url_default;
+  if (!baseURL) throw new DecideError('provider_error', `decide: ${a.provider} has no server URL (gbrain config set provider_base_urls.${recipe.id} http://<host>:<port>/v1)`);
+  const url = `${baseURL.replace(/\/$/, '')}${tp.path}`;
   const headers = { ...authToHeaders(applyResolveAuth(recipe, gw, 'reranker')), 'Content-Type': 'application/json' };
 
   const stateTokens = estimateContextTokens(a.state);
-  const plan = planBatches(stateTokens, a.ordered.map((q) => estimateContextTokens(toWireQuestion(q))));
+  // Budgets come from the recipe: a self-hosted server can serve a smaller
+  // context than TypeSafe, and must never see a request it would truncate.
+  const plan = planBatches(stateTokens, a.ordered.map((q) => estimateContextTokens(toWireQuestion(q))), {
+    stateQuestion: tp.max_state_question_tokens, total: tp.max_request_tokens,
+  });
   const bodies = plan.map((b) => JSON.stringify(buildTypeSafeRequest(modelId, a.state, b.indices.map((i) => a.ordered[i]!))));
   if (bodies.some((body) => Buffer.byteLength(body, 'utf8') > tp.max_payload_bytes)) {
     throw new DecideError('payload_too_large', 'decide: request exceeds the payload byte cap');

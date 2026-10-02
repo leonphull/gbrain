@@ -21,7 +21,7 @@ import type { BrainEngine, TakeHit } from '../engine.ts';
 import type { SearchResult } from '../types.ts';
 import { loadConfigSnapshot } from '../config-snapshot.ts';
 import { answerableK, answerableQuestion, reduceAnswerable } from '../ai/decide/answerable.ts';
-import { pickDecideConfig, readDecideConfig, type DecideConfig } from '../ai/decide/config.ts';
+import { pickDecideConfig, readDecideConfig, thirdPartyDecideProvider, type DecideConfig } from '../ai/decide/config.ts';
 import { hasTypesafeKey, runDecide } from '../ai/decide/index.ts';
 import { packShape } from '../ai/decide/pack.ts';
 import { driftReason, resolveSlotPolicy, type SlotPolicy } from '../ai/decide/policy.ts';
@@ -95,7 +95,7 @@ function answerability(ctx: Ctx, policy: SlotPolicy): ThinkDecide['answerability
     if (policy.requested === 'off') return null;
     const sourceOf = new Map(pages.map((p) => [p.slug, p.source_id ?? 'default']));
     // Takes held by anyone but `world` are private: never sent to a third party without decide.egress.private=allow.
-    const thirdParty = policy.provider.startsWith('typesafe:');
+    const thirdParty = thirdPartyDecideProvider(policy.provider);
     const sendable = takes.filter((t) => !thirdParty || ctx.cfg.egressPrivate === 'allow' || t.holder === 'world');
     const evidence: EvidenceItem[] = [
       ...pages.map(candidateItem),

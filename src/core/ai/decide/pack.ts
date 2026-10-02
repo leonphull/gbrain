@@ -41,7 +41,18 @@ export interface PlannedBatch {
  * Split questions into batches under both limits. Throws payload_too_large
  * when one state + question pair cannot fit (never trims evidence).
  */
-export function planBatches(stateTokens: number, questionTokens: readonly number[]): PlannedBatch[] {
+export interface BatchBudgets {
+  /** Limit for state + the longest single question. */
+  stateQuestion: number;
+  /** Limit for state + every question in one request. */
+  total: number;
+}
+
+export function planBatches(
+  stateTokens: number,
+  questionTokens: readonly number[],
+  budgets: BatchBudgets = { stateQuestion: STATE_QUESTION_BUDGET, total: TOTAL_INPUT_BUDGET },
+): PlannedBatch[] {
   const batches: PlannedBatch[] = [];
   let start = 0;
   while (start < questionTokens.length) {
@@ -54,7 +65,7 @@ export function planBatches(stateTokens: number, questionTokens: readonly number
       total += t;
       longest = Math.max(longest, t);
       const estimated = stateTokens + total + TOKEN_HEADROOM;
-      if (stateTokens + longest + TOKEN_HEADROOM > STATE_QUESTION_BUDGET || estimated > TOTAL_INPUT_BUDGET) break;
+      if (stateTokens + longest + TOKEN_HEADROOM > budgets.stateQuestion || estimated > budgets.total) break;
       accepted = count;
       acceptedTokens = estimated;
     }

@@ -9,8 +9,18 @@ and GBrain's code owns every threshold, floor and fallback.
 
 The first provider is TypeSafe's Jev (under a second per request, $0.042 per
 million input tokens, output free). Any chat model you already configured can
-answer the same questions through an `llm:` provider. Setup for the key and
-the reranker: [TypeSafe (Jev)](../ai-providers/typesafe.md). Contract for
+answer the same questions through an `llm:` provider. A third provider id,
+`systemone:<model>`, points at a **self-hosted** Jev-compatible decision
+server (for example Cloudflare's open-source Clef / Clef-flash served from
+your own GPU box): same wire format, no TypeSafe key, and nothing leaves your
+infrastructure. Setup:
+`gbrain config set provider_base_urls.systemone http://<host>:<port>/v1`
+(there is intentionally no default URL — a misconfigured id fails, it never
+falls back to TypeSafe), then
+`gbrain decide enable <slot> --provider systemone:<model>`. Calibrate the
+model the same way as any provider:
+`gbrain decide calibrate --slot <slot> --dataset <jsonl>`. Setup for the key
+and the reranker: [TypeSafe (Jev)](../ai-providers/typesafe.md). Contract for
 contributors: [`docs/architecture/decide.md`](../architecture/decide.md).
 
 Every decision point is a **slot**. Each slot is **off** (today's behavior)
@@ -443,6 +453,11 @@ consent for that provider.
   every provider and every path.
 - **`llm:` providers** follow today's chat egress rules: they are providers
   you already send this data to.
+- **Self-hosted `systemone:` providers** are operator-owned the same way: a
+  decision server on your own infrastructure needs no data-class consent and
+  has no private-egress gate, because its content never leaves your
+  infrastructure. Only denied sources apply there, and a misconfigured id
+  fails loudly instead of falling back to TypeSafe's cloud endpoint.
 - **Egress fallback**: `decide.egress_fallback llm:<provider:model>` answers
   only the items egress refused, as a separate decision with its own
   calibration. Timeouts, 429s and budget exhaustion never go to the fallback.

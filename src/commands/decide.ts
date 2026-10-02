@@ -279,10 +279,12 @@ export function ensureGatewayForProbe(): void {
 export async function cmdProbe(engine: BrainEngine | null, args: string[]): Promise<number> {
   ensureGatewayForProbe();
   const json = has(args, '--json');
-  const key = typesafeApiKey(requireConfig().env);
-  if (!key) { console.error(refusalLine('no_key')); return 1; }
   const cfg = engine ? readDecideConfig((await loadConfigSnapshot(engine)) ?? {}) : readDecideConfig(null);
-  const provider = cfg.provider.startsWith('typesafe:') ? cfg.provider : DEFAULT_TYPESAFE_PROVIDER;
+  // A configured self-hosted System One id probes against that server (no key needed);
+  // the TypeSafe default keeps its key gate.
+  const provider = providerKind(cfg.provider) === 'systemone' ? cfg.provider : cfg.provider.startsWith('typesafe:') ? cfg.provider : DEFAULT_TYPESAFE_PROVIDER;
+  const key = typesafeApiKey(requireConfig().env);
+  if (!key && providerKind(provider) !== 'systemone') { console.error(refusalLine('no_key')); return 1; }
   const query = flagValue(args, '--query');
   if (query) {
     if (!engine) { console.error('probe --query needs a brain: run it on the brain host.'); return 1; }
@@ -294,13 +296,13 @@ export async function cmdProbe(engine: BrainEngine | null, args: string[]): Prom
     const r = await runDecide({ slot: 'evidence', callSite: 'probe', state: {}, questions: PROBE_QUESTIONS, provider, deadlineMs: 10_000, lane: 'background' }, { engine: null, config: consentCfg });
     const out = {
       requested: provider, model_resolved: r.model_resolved, latency_ms: r.latency_ms, input_tokens: r.usage.input_tokens,
-      cost_usd: Number(r.cost_usd.toFixed(8)), key_from: key.from, brain_content_sent: false,
+      cost_usd: Number(r.cost_usd.toFixed(8)), key_from: key?.from ?? null, brain_content_sent: false,
       answers: r.answers, next: 'gbrain decide probe --query "<a question your brain can answer>"',
     };
     if (json) console.log(JSON.stringify(out, null, 2));
     else {
-      console.log(`TypeSafe Jev probe: resolved ${r.model_resolved} (requested ${provider}) in ${r.latency_ms} ms, ${r.usage.input_tokens} input tokens, $${r.cost_usd.toFixed(6)}.`);
-      console.log(`Key: ${key.from}. No brain content was sent.`);
+      console.log(`${providerKind(provider) === 'systemone' ? 'Self-hosted System One' : 'TypeSafe Jev'} probe: resolved ${r.model_resolved} (requested ${provider}) in ${r.latency_ms} ms, ${r.usage.input_tokens} input tokens, $${r.cost_usd.toFixed(6)}.`);
+      console.log(`Key: ${key?.from ?? 'not set'}. No brain content was sent.`);
       console.log(`Next: ${out.next}`);
     }
     return 0;
@@ -372,7 +374,7 @@ async function cmdEnable(engine: BrainEngine, args: string[]): Promise<number> {
     return 0;
   }
   const requestedProvider = flagValue(args, '--provider');
-  if (requestedProvider && !isValidProvider(requestedProvider)) { console.error(`--provider must be typesafe:<model> or llm:<provider:model> (got ${requestedProvider})`); return 1; }
+  if (requestedProvider && !isValidProvider(requestedProvider)) { console.error(`--provider must be typesafe:<model>, systemone:<model> or llm:<provider:model> (got ${requestedProvider})`); return 1; }
   const base = requestedProvider ?? state.cfg.slots[slot].provider;
   if (providerKind(base) === 'none' && slot !== 'rerank') { console.error(refusalLine('no_provider', slot)); return 1; }
   let provider = providerKind(base) === 'none' ? DEFAULT_TYPESAFE_PROVIDER : base;
@@ -383,6 +385,7 @@ async function cmdEnable(engine: BrainEngine, args: string[]): Promise<number> {
   if (state.cfg.provider === 'none' || (requestedProvider && state.cfg.provider === requestedProvider)) writes.push(['decide.provider', provider]);
   else if (requestedProvider) writes.push([`decide.slots.${slot}.provider`, provider]);
   const typesafe = providerKind(provider) === 'typesafe';
+  const selfHosted = providerKind(provider) === 'systemone';
   const classes = SLOT_SPECS[slot].egressClasses;
   if (typesafe && slot !== 'rerank') for (const c of classes) writes.push([`decide.egress.typesafe.${c}`, 'allow']);
   if (typesafe && PRIVATE_SLOTS.includes(slot) && state.cfg.egressPrivate === 'deny' && state.cfg.egressFallback === 'none') {
@@ -406,7 +409,7 @@ async function cmdEnable(engine: BrainEngine, args: string[]): Promise<number> {
     `Enable ${slot} (${SLOT_PLAIN_NAMES[slot]}) ${mode === 'shadow' ? 'in shadow (advanced diagnostics)' : 'on'} with ${provider}.`,
     slot === 'rerank'
       ? 'Data that leaves this machine: query and candidate text go to TypeSafe as the search reranker, exactly as with any configured reranker (Voyage today).'
-      : `Data that leaves this machine: ${classes.join(', ')} text to ${typesafe ? 'TypeSafe' : 'your configured chat provider'}; private pages stay local unless decide.egress.private=allow.`,
+      : `Data that leaves this machine: ${classes.join(', ')} text to ${selfHosted ? 'your self-hosted System One server (operator-owned; nothing leaves your infrastructure)' : typesafe ? 'TypeSafe' : 'your configured chat provider'}; private pages stay local unless decide.egress.private=allow.`,
     ...(slot === 'conflict' && typesafe ? [await conflictShareLine(engine, state.cfg.egressPrivate === 'allow' ? 'are sent (decide.egress.private=allow)' : 'go to decide.egress_fallback')] : []),
     ...(cost.usd !== null ? [`Estimated cost: ~$${cost.usd.toFixed(4)} per 1,000 ${COST_UNITS[slot]?.unit ?? 'units'}; daily cap $${nextCfg.dailyUsd.toFixed(2)} (decide.budget.daily_usd${slot === 'rerank' ? '; S1 on uses reranker spend controls' : ''}).`] : []),
     `Writes: ${[...writes, ...(slot === 'rerank' ? [['search.reranker.model', provider], ['search.reranker.enabled', 'true']] : [])].map(([k, v]) => `${k}=${v}`).join(', ')}`,

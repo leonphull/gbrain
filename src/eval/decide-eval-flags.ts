@@ -31,7 +31,7 @@ import { readFileSync } from 'node:fs';
 import { basename } from 'node:path';
 import type { BrainEngine } from '../core/engine.ts';
 import {
-  DEFAULT_TYPESAFE_PROVIDER, enableDecideEvalOverride, isValidProvider, parseEvalSlots, readDecideConfig,
+  DEFAULT_TYPESAFE_PROVIDER, enableDecideEvalOverride, isValidProvider, parseEvalSlots, providerKind, readDecideConfig,
 } from '../core/ai/decide/config.ts';
 import { parseDatasetJsonl, splitHash, type DatasetItem } from '../core/ai/decide/dataset.ts';
 import { hasTypesafeKey } from '../core/ai/decide/index.ts';
@@ -92,7 +92,7 @@ export function applyDecideEvalFlag(o: DecideEvalOptions, flag: string, value: s
       return true;
     }
     case '--decide-provider':
-      if (!isValidProvider(value) || value === 'none') throw new Error(`--decide-provider must be typesafe:<model> or llm:<provider:model> (got: ${value})`);
+      if (!isValidProvider(value) || value === 'none') throw new Error(`--decide-provider must be typesafe:<model>, systemone:<model> or llm:<provider:model> (got: ${value})`);
       o.provider = value;
       return true;
     case '--decide-calibration':
@@ -322,7 +322,7 @@ export function operatorBrainRefusal(snapshot: Record<string, string>, run: Deci
   for (const slot of Object.keys(run.slots) as DecideSlot[]) {
     const provider = slot === 'rerank' ? cfg.provider : cfg.slots[slot].provider;
     if (provider === 'none') return refusalLine('no_provider', slot);
-    if ((provider.startsWith('typesafe:') || slot === 'rerank') && !hasTypesafeKey()) return refusalLine('no_key', slot);
+    if ((provider.startsWith('typesafe:') || slot === 'rerank') && providerKind(provider) !== 'systemone' && !hasTypesafeKey()) return refusalLine('no_key', slot);
     if (slot === 'rerank' || !provider.startsWith('typesafe:')) continue;
     if (SLOT_SPECS[slot].egressClasses.some((c) => !cfg.consent[c])) return refusalLine('egress_class_denied', slot);
     if (SLOT_SPECS[slot].egressClasses.includes('conversation') && cfg.egressPrivate !== 'allow' && cfg.egressFallback === 'none') return refusalLine('egress_private_denied', slot);

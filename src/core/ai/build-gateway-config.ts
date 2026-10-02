@@ -65,6 +65,10 @@ export function buildGatewayConfig(c: GBrainConfig): AIGatewayConfig {
   if (process.env.LMSTUDIO_BASE_URL) envBaseUrls['lmstudio'] = process.env.LMSTUDIO_BASE_URL;
   if (process.env.LITELLM_BASE_URL) envBaseUrls['litellm'] = process.env.LITELLM_BASE_URL;
   if (process.env.OPENROUTER_BASE_URL) envBaseUrls['openrouter'] = process.env.OPENROUTER_BASE_URL;
+  // Self-hosted System One (Jev-compatible) decide server. Env fallback only:
+  // `provider_base_urls.systemone` in the config plane wins, matching the
+  // siblings above (v0.32 codex finding #4+#5 pattern).
+  if (process.env.SYSTEMONE_BASE_URL) envBaseUrls['systemone'] = process.env.SYSTEMONE_BASE_URL;
 
   // #3350: native base-URL fold — MUST read the file plane directly, not `c`
   // (callers can pass a DB-merged config; see foldNativeBaseUrlsFromFilePlane's

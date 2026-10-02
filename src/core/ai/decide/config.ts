@@ -33,7 +33,7 @@ const number = (min: number, max: number, integer = false): Validator => (v) => 
   return null;
 };
 const bool: Validator = (v) => ['true', 'false', 'on', 'off', '1', '0', 'yes', 'no'].includes(v.trim().toLowerCase()) ? null : 'must be true or false';
-const provider: Validator = (v) => isValidProvider(v) ? null : 'must be none, typesafe:<model> or llm:<provider:model>';
+const provider: Validator = (v) => isValidProvider(v) ? null : 'must be none, typesafe:<model>, systemone:<model> or llm:<provider:model>';
 const fallback: Validator = (v) => v === 'none' || /^llm:[a-z0-9-]+:.+$/i.test(v) ? null : 'must be none or llm:<provider:model>';
 const sourceList: Validator = (v) => {
   try {
@@ -44,7 +44,7 @@ const sourceList: Validator = (v) => {
 const calibrationRef: Validator = (v) => /^(local:\d+|ref:[a-z0-9._:-]+)$/i.test(v) ? null : 'must be local:<id> or ref:<id>';
 
 export function isValidProvider(v: string): boolean {
-  return v === 'none' || /^typesafe:jev-[a-z0-9.-]+$/i.test(v) || /^llm:[a-z0-9-]+:.+$/i.test(v);
+  return v === 'none' || /^typesafe:jev-[a-z0-9.-]+$/i.test(v) || /^systemone:[a-z0-9.-]+$/i.test(v) || /^llm:[a-z0-9-]+:.+$/i.test(v);
 }
 
 const GLOBAL_KEYS: Record<string, Validator> = {
@@ -251,10 +251,22 @@ export function allSlotsOff(cfg: DecideConfig): boolean {
   return DECIDE_SLOTS.every((slot) => cfg.slots[slot].mode === 'off');
 }
 
-export function providerKind(provider: string): 'typesafe' | 'llm' | 'none' {
+export function providerKind(provider: string): 'typesafe' | 'systemone' | 'llm' | 'none' {
   if (provider.startsWith('typesafe:')) return 'typesafe';
+  if (provider.startsWith('systemone:')) return 'systemone';
   if (provider.startsWith('llm:')) return 'llm';
   return 'none';
+}
+
+/**
+ * Providers that receive brain content as a THIRD party: data-class consent
+ * and the private-egress rules apply. `systemone:<model>` ids are
+ * operator-owned (self-hosted System One server, like a `llm:` route the
+ * operator already sends data to) — only `decide.egress.deny_sources` applies
+ * there. One place so every egress surface agrees.
+ */
+export function thirdPartyDecideProvider(provider: string): boolean {
+  return provider.startsWith('typesafe:');
 }
 
 export function isTypesafeAlias(provider: string): boolean {

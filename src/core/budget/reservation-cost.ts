@@ -62,6 +62,18 @@ const FREE_LOCAL_RERANK_PROVIDERS: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * Self-hosted System One (`systemone:<model>` provider ids, e.g. Cloudflare
+ * Clef / Clef-flash served from the operator's own GPU box): local inference,
+ * electricity not tokens. Zero-priced for BOTH the rerank and decide kinds so
+ * the budget tracker's TX2 fail-closed contract never hard-fails a bounded job
+ * on the local provider. Checked after the pricing tables so an
+ * explicitly-priced entry, should one ever be added, still wins.
+ */
+const FREE_LOCAL_SYSTEMONE_PROVIDERS: ReadonlySet<string> = new Set([
+  'systemone',
+]);
+
+/**
  * Provider id prefixes whose embeddings run on local inference (electricity,
  * not API tokens) and so price at $0. Without this, a `--max-cost`-bounded
  * embed/reindex job configured for a local provider TX2 hard-fails because
@@ -143,6 +155,12 @@ function lookupPricing(modelId: string, kind: BudgetKind): ModelPricing | null {
   // under `--max-cost`. Only the rerank kind — chat/embed already have
   // their own provider-specific pricing surfaces.
   if (kind === 'rerank' && providerId && FREE_LOCAL_RERANK_PROVIDERS.has(providerId)) {
+    return { input: 0, output: 0 };
+  }
+  // Self-hosted System One prices at $0 for decide calls too — same TX2
+  // rationale as FREE_LOCAL_RERANK_PROVIDERS above: a --max-cost-bounded decide
+  // job on the local provider must not hard-fail with no_pricing.
+  if ((kind === 'rerank' || kind === 'decide') && providerId && FREE_LOCAL_SYSTEMONE_PROVIDERS.has(providerId)) {
     return { input: 0, output: 0 };
   }
   // Fall back to the full canonical pricing table so non-Anthropic chat
