@@ -181,3 +181,12 @@ describe('systemone batch budgets', () => {
     expect(localBatches.flatMap((b) => b.indices)).toEqual(questions.map((_, i) => i));
   });
 });
+
+describe('systemone calibration lookup', () => {
+  test('lookupModel keys a systemone provider by its model id so calibrations are found', async () => {
+    const { lookupModel } = await import('../../src/core/ai/decide/policy.ts');
+    expect(lookupModel('systemone:clef-flash')).toBe('clef-flash');
+    expect(lookupModel('systemone:clef-flash', { 'systemone:clef-flash': 'clef-flash-2' })).toBe('clef-flash-2');
+    expect(lookupModel('none')).toBeNull();
+  });
+});

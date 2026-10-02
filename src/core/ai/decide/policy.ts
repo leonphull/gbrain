@@ -126,6 +126,9 @@ export function lookupModel(provider: string, lastResolved?: Readonly<Record<str
   const kind = providerKind(provider);
   if (kind === 'typesafe') return isTypesafeAlias(provider) ? lastResolved?.[provider] ?? null : provider.replace(/^typesafe:/, '');
   if (kind === 'llm') return lastResolved?.[provider] ?? llmChatModel(provider);
+  // Self-hosted servers answer with their own model id; before the first answer
+  // the requested id is the best key (it matches what the calibration stored).
+  if (kind === 'systemone') return lastResolved?.[provider] ?? provider.replace(/^systemone:/, '');
   return null;
 }
 
